@@ -1,0 +1,215 @@
+import os
+import re
+import json
+import string
+import logging
+import random
+import numpy as np
+from datetime import datetime
+from tqdm import tqdm
+from typing import List, Dict, Tuple, Optional
+from torch.utils.data import DataLoader, Dataset
+from sentence_transformers import InputExample, SentenceTransformer, losses, evaluation, util
+
+
+# Configure logging
+logging.basicConfig(
+    format="%(asctime)s - %(level)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
+
+# Constants
+MODEL_ROOT = "/LLM_Models"
+INTENT_DATA_ROOT = "/Projects/Data/"
+OUTPUT_DIR = os.path.join(os.getcwd(), "..", "saves", "sbert_trains")
+DATA_FILES = ["small_talk.json"]
+TURKISH_TO_ENGLISH = {'ş': 's', 'ç': 'c', 'ö': 'o', 'ğ': 'g', 'ü': 'u', 'ı': 'i'}
+HARD_NEGATIVE_THRESHOLD = 0.99
+
+
+class Config:
+    """Configuration class for hyperparameters and paths."""
+    TRAIN_BATCH_SIZE = 1024 * 3
+    MAX_SEQ_LENGTH = 35
+    EPOCHS = 9000
+    LR = 2e-5
+    CE_SCORE_MARGIN = 3.0
+    NEW_MODEL_NAME = "qa_mnrl"
+    MODEL_PATH = os.path.join(MODEL_ROOT, "bi-encoder-mnrl-dbmdz-bert-base-turkish-cased-margin_3.0-msmarco-tr-10k")
+
+
+class DataPreprocessor:
+    """Utility class for text preprocessing."""
+
+    @staticmethod
+    def remove_punctuation(text: str, remove_links: bool = True) -> str:
+        """Remove links and punctuations from the text."""
+        # Remove URLs
+        url_pattern = re.compile(r'https?://(?:www\.)?[^\s/$.?#].[^\s]*')
+        if remove_links:
+            text = url_pattern.sub("", text)
+        # Remove punctuations
+        punctuations = string.punctuation.replace("|", "").replace("+", "")
+        text = text.translate(str.maketrans("", "", punctuations))
+        # Replace special characters
+        for char in ["\n", "\t", "-", "/", "&", "_"]:
+            text = text.replace(char, " ")
+        # Remove extra spaces
+        return " ".join(text.split())
+
+    @staticmethod
+    def ascify(text: str) -> str:
+        """Convert Turkish characters to their English equivalents."""
+        return ''.join(TURKISH_TO_ENGLISH.get(char, char) for char in text.lower())
+
+
+class DatasetBuilder:
+    """Builds datasets for training and evaluation."""
+
+    def __init__(self, questions: List[str], answers: List[str], ms_marco_model: SentenceTransformer):
+        self.questions = questions
+        self.answers = answers
+        self.ms_marco_model = ms_marco_model
+
+    def create_pairing_list(self, exp_negative_size: int = 15) -> List[List[List[int]]]:
+        """Creates pairing lists including hard negatives."""
+        pairing_list = []
+
+        for i in tqdm(range(len(self.questions)), desc="Generating Pairing List"):
+            subset = [[], [], []]  # [positives, negatives, hard_negatives]
+            subset[0].append(i)  # Positive: Self
+
+            # Compute cosine similarity
+            q_embedding = self.ms_marco_model.encode([self.questions[i]])
+            a_embeddings = self.ms_marco_model.encode(self.answers)
+            qa_similarity = self.ms_marco_model.similarity(q_embedding, a_embeddings).to("cpu").tolist()
+            tipping_point = qa_similarity[0][i]
+
+            # Find hard negatives
+            hard_negatives = [
+                ix for ix, sim in enumerate(qa_similarity[0])
+                if tipping_point <= sim < HARD_NEGATIVE_THRESHOLD and ix != i
+            ]
+            subset[2].extend(hard_negatives)
+
+            # Randomly sample negatives
+            picked = set(subset[0] + subset[2])
+            all_indices = set(range(len(self.questions)))
+            negative_candidates = list(all_indices - picked)
+            subset[1].extend(random.sample(negative_candidates, min(len(negative_candidates), exp_negative_size)))
+
+            pairing_list.append(subset)
+        return pairing_list
+
+    def build_datasets(self, pairing_list: List[List[List[int]]]) -> Tuple[List[Dict], List[Dict]]:
+        """Prepare datasets for training and evaluation."""
+        data_ms_format_train = []
+        data_ms_format_eval = []
+
+        for i, pair in enumerate(pairing_list):
+            train_sample, eval_sample = self.create_structure(
+                qid=i,
+                query=self.questions[i],
+                positives=pair[0],
+                negatives=pair[1],
+                hard_negatives=pair[2],
+                answers=self.answers
+            )
+            data_ms_format_train.append(train_sample)
+            if eval_sample:
+                data_ms_format_eval.append(eval_sample)
+
+        return data_ms_format_train, data_ms_format_eval
+
+    @staticmethod
+    def create_structure(
+        qid: int, query: str, positives: List[int], negatives: List[int], hard_negatives: List[int], answers: List[str],
+        max_neg: int = 30, max_hard_neg: int = 20
+    ) -> Tuple[Dict, Optional[Dict]]:
+        """Structure data for training."""
+        train_data = {
+            qid: {
+                'qid': qid,
+                'query': query,
+                'pos': positives,
+                'neg': negatives[:max_neg] + hard_negatives[:max_hard_neg]
+            }
+        }
+        eval_data = {
+            qid: {
+                'qid': qid,
+                'query': query,
+                'pos': positives
+            }
+        } if positives else None
+
+        return train_data, eval_data
+
+
+def load_data(file_paths: List[str]) -> List[Dict[str, str]]:
+    """Loads and preprocesses data from JSON files."""
+    data = []
+    for file_path in file_paths:
+        with open(file_path, 'r') as file:
+            raw_data = json.load(file)
+        data.extend(
+            {"short": DataPreprocessor.remove_punctuation(item["short"]), "answer": DataPreprocessor.remove_punctuation(item["answer"])}
+            for item in raw_data
+        )
+    return data
+
+
+def main():
+    # Load and preprocess data
+    file_paths = [os.path.join(INTENT_DATA_ROOT, file) for file in DATA_FILES]
+    data = load_data(file_paths)
+
+    # Extend dataset with ascified text
+    extended_data = [
+        {"short": DataPreprocessor.ascify(sample["short"]), "answer": sample["answer"]}
+        for sample in data if sample["short"] != DataPreprocessor.ascify(sample["short"])
+    ]
+    data.extend(extended_data)
+
+    # Prepare questions and answers
+    questions = [item["short"] for item in data]
+    answers = [item["answer"] for item in data]
+
+    # Load SentenceTransformer model
+    ms_marco_model = SentenceTransformer(Config.MODEL_PATH)
+
+    # Create pairing list
+    dataset_builder = DatasetBuilder(questions, answers, ms_marco_model)
+    pairing_list = dataset_builder.create_pairing_list()
+
+    # Build datasets
+    train_data, eval_data = dataset_builder.build_datasets(pairing_list)
+
+    # Model setup
+    model = SentenceTransformer(Config.MODEL_PATH)
+    model.max_seq_length = Config.MAX_SEQ_LENGTH
+
+    # Dataset and DataLoader
+    train_dataset = MSMARCODataset(train_data, corpus={i: d["answer"] for i, d in enumerate(data)})
+    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=Config.TRAIN_BATCH_SIZE)
+
+    # Training
+    train_loss = losses.MultipleNegativesRankingLoss(model=model)
+    model.fit(
+        train_objectives=[(train_dataloader, train_loss)],
+        epochs=Config.EPOCHS,
+        warmup_steps=100,
+        optimizer_params={"lr": Config.LR},
+        checkpoint_path=OUTPUT_DIR,
+        use_amp=True,
+    )
+
+    # Save the trained model
+    model_save_path = os.path.join(OUTPUT_DIR, f'{Config.NEW_MODEL_NAME}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
+    os.makedirs(model_save_path, exist_ok=True)
+    model.save(model_save_path)
+
+
+if __name__ == "__main__":
+    main()
